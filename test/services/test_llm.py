@@ -5,8 +5,10 @@ import tempfile
 import tomllib
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -173,6 +175,18 @@ class TestScriptPromptOptions(unittest.TestCase):
             result = llm.generate_script(video_subject="Coffee")
 
         self.assertEqual(result, "")
+
+    def test_generate_script_does_not_return_stale_quota_error_after_retries(self):
+        responses = ["当日额度已消耗完"] + [
+            RuntimeError("provider unavailable")
+        ] * (llm._max_retries - 1)
+        with patch.object(
+            llm, "_generate_response", side_effect=responses
+        ) as generate_response:
+            result = llm.generate_script(video_subject="Coffee")
+
+        self.assertEqual(result, "")
+        self.assertEqual(generate_response.call_count, llm._max_retries)
 
     def test_generate_script_strips_each_bracket_group_independently(self):
         """
@@ -1195,6 +1209,47 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertIn("Error:", result)
         self.assertIn("returned empty choices", result)
         self.assertNotIn("NoneType", result)
+
+    def test_qwen_concurrent_snapshots_keep_their_own_api_keys(self):
+        class FakeGenerationResponse(dict):
+            status_code = 200
+
+        barrier = Barrier(2, timeout=5)
+        calls = {}
+        fake_dashscope = types.SimpleNamespace(api_key="unrelated-global-key")
+
+        def call(**kwargs):
+            barrier.wait()
+            prompt = kwargs["messages"][0]["content"]
+            calls[prompt] = kwargs.get("api_key")
+            return FakeGenerationResponse({"output": {"text": prompt}})
+
+        fake_dashscope.Generation = types.SimpleNamespace(call=call)
+        modules = {
+            "dashscope": fake_dashscope,
+            "dashscope.api_entities": types.SimpleNamespace(),
+            "dashscope.api_entities.dashscope_response": types.SimpleNamespace(
+                GenerationResponse=FakeGenerationResponse
+            ),
+        }
+        with patch.dict(sys.modules, modules), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                llm._generate_response,
+                "first prompt",
+                {"llm_provider": "qwen", "qwen_api_key": "first-key"},
+            )
+            second = pool.submit(
+                llm._generate_response,
+                "second prompt",
+                {"llm_provider": "qwen", "qwen_api_key": "second-key"},
+            )
+            self.assertEqual(first.result(), "first prompt")
+            self.assertEqual(second.result(), "second prompt")
+
+        self.assertEqual(
+            calls, {"first prompt": "first-key", "second prompt": "second-key"}
+        )
+        self.assertEqual(fake_dashscope.api_key, "unrelated-global-key")
 
     def test_apimart_provider_uses_unwrapped_openai_compatible_endpoint(self):
         """

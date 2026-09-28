@@ -785,6 +785,39 @@ class TestMaterialTlsVerification(unittest.TestCase):
             self.assertLessEqual(response.chunk_size, 1024 * 1024)
             self.assertTrue(get.call_args.kwargs["stream"])
 
+    def test_save_video_distinguishes_assets_in_download_query(self):
+        """Different paid assets can share a /download path and differ only by query."""
+        first_url = "https://cdn.example.com/download?file_id=first"
+        second_url = "https://cdn.example.com/download?file_id=second"
+
+        class FakeVideoFileClip:
+            duration = 1
+            fps = 24
+
+            def __init__(self, path):
+                pass
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "app.services.material.requests.get",
+                side_effect=[
+                    _FakeVideoDownloadResponse(b"first generated scene"),
+                    _FakeVideoDownloadResponse(b"second generated scene"),
+                ],
+            ) as get, patch("app.services.material.VideoFileClip", FakeVideoFileClip):
+                first_path = material.save_video(first_url, save_dir=temp_dir)
+                second_path = material.save_video(second_url, save_dir=temp_dir)
+                cached_path = material.save_video(first_url, save_dir=temp_dir)
+
+            self.assertNotEqual(first_path, second_path)
+            self.assertEqual(Path(first_path).read_bytes(), b"first generated scene")
+            self.assertEqual(Path(second_path).read_bytes(), b"second generated scene")
+            self.assertEqual(cached_path, first_path)
+            self.assertEqual(get.call_count, 2)
+
     def test_save_video_cleans_partial_stream_when_download_fails(self):
         class FailingResponse(_FakeVideoDownloadResponse):
             def __init__(self):
@@ -807,6 +840,45 @@ class TestMaterialTlsVerification(unittest.TestCase):
                     )
 
             self.assertTrue(response.closed)
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+    def test_save_video_rejects_declared_oversized_download_before_streaming(self):
+        class OversizedResponse(_FakeVideoDownloadResponse):
+            headers = {"Content-Length": "9"}
+
+            def iter_content(self, chunk_size):
+                raise AssertionError("oversized body should not be read")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("app.services.material.MAX_VIDEO_DOWNLOAD_BYTES", 8, create=True),
+                patch(
+                    "app.services.material.requests.get",
+                    return_value=OversizedResponse(b""),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "download exceeds"):
+                    material.save_video("https://example.com/large.mp4", temp_dir)
+
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+    def test_save_video_stops_undeclared_oversized_stream_and_cleans_temp(self):
+        class StreamingResponse(_FakeVideoDownloadResponse):
+            def iter_content(self, chunk_size):
+                yield b"first"
+                yield b"second"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("app.services.material.MAX_VIDEO_DOWNLOAD_BYTES", 8, create=True),
+                patch(
+                    "app.services.material.requests.get",
+                    return_value=StreamingResponse(b""),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "download exceeds"):
+                    material.save_video("https://example.com/stream.mp4", temp_dir)
+
             self.assertEqual(list(Path(temp_dir).iterdir()), [])
 
     def test_invalid_download_is_not_reused_as_cached_video(self):
@@ -1930,6 +2002,50 @@ class TestWaveSpeedProvider(unittest.TestCase):
         # 5s + 5s == 10s,恰好覆盖,第 3 段绝不能生成
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(result, ["/tmp/1.mp4", "/tmp/2.mp4"])
+
+    def test_download_videos_wavespeed_rejects_nonfinite_duration_before_submission(self):
+        """NaN/Infinity must not buy a video for every script keyword."""
+        for duration in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(duration=duration):
+                with patch("app.services.material.generate_videos_wavespeed") as generate:
+                    with self.assertRaisesRegex(ValueError, "finite"):
+                        material.download_videos(
+                            task_id="test-wavespeed-invalid-duration",
+                            search_terms=["term-1", "term-2"],
+                            source="wavespeed",
+                            audio_duration=duration,
+                            max_clip_duration=5,
+                        )
+                    generate.assert_not_called()
+
+    def test_download_videos_wavespeed_rejects_nonpositive_clip_duration(self):
+        """A zero clip duration cannot advance paid coverage."""
+        with patch("app.services.material.generate_videos_wavespeed") as generate:
+            with self.assertRaisesRegex(ValueError, "clip duration"):
+                material.download_videos(
+                    task_id="test-wavespeed-invalid-clip",
+                    search_terms=["term-1", "term-2"],
+                    source="wavespeed",
+                    audio_duration=10,
+                    max_clip_duration=0,
+                )
+            generate.assert_not_called()
+
+    def test_download_videos_wavespeed_skips_nonpositive_audio_duration(self):
+        """An empty narration must not start a paid generation request."""
+        with (
+            patch("app.services.material.generate_videos_wavespeed") as generate,
+            patch("app.services.material._persist_material_sources"),
+        ):
+            result = material.download_videos(
+                task_id="test-wavespeed-empty-audio",
+                search_terms=["term-1", "term-2"],
+                source="wavespeed",
+                audio_duration=0,
+                max_clip_duration=5,
+            )
+        self.assertEqual(result, [])
+        generate.assert_not_called()
 
     def test_download_videos_wavespeed_skips_failed_segment_and_continues(self):
         """单个片段生成失败(空结果)时跳过该关键词,继续为后续片段生成。"""
