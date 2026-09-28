@@ -3,6 +3,7 @@ import io
 import math
 import os
 import random
+import tempfile
 import threading
 import time
 import uuid
@@ -262,7 +263,7 @@ def _matches_video_aspect(
     try:
         normalized_width = int(float(width))
         normalized_height = int(float(height))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         normalized_width = 0
         normalized_height = 0
 
@@ -337,21 +338,40 @@ def search_videos_pexels(
         )
         response = r.json()
         video_items = []
-        if "videos" not in response:
+        if not isinstance(response, dict) or not isinstance(
+            response.get("videos"), list
+        ):
             logger.error("pexels video search returned an unsupported response")
             return video_items
         videos = response["videos"]
         # loop through each video in the result
         for v in videos:
-            duration = v["duration"]
-            # check if video has desired minimum duration
-            if duration < minimum_duration:
+            if not isinstance(v, dict):
                 continue
-            video_files = v["video_files"]
+            duration = v.get("duration")
+            # check if video has desired minimum duration
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration < minimum_duration
+            ):
+                continue
+            video_files = v.get("video_files")
+            if not isinstance(video_files, list):
+                continue
             # loop through each url to determine the best quality
             for video in video_files:
-                w = int(video["width"])
-                h = int(video["height"])
+                if not isinstance(video, dict):
+                    continue
+                try:
+                    w = int(video.get("width"))
+                    h = int(video.get("height"))
+                except (OverflowError, TypeError, ValueError):
+                    continue
+                video_url = video.get("link")
+                if not isinstance(video_url, str) or not video_url:
+                    continue
                 if (
                     _matches_video_aspect(w, h, aspect)
                     and w == video_width
@@ -359,7 +379,7 @@ def search_videos_pexels(
                 ):
                     item = MaterialInfo()
                     item.provider = "pexels"
-                    item.url = video["link"]
+                    item.url = video_url
                     item.duration = duration
                     item.source_info = {
                         "provider": "pexels",
@@ -456,24 +476,39 @@ def search_videos_pixabay(
             return []
 
         video_items = []
-        if "hits" not in response:
+        if not isinstance(response, dict) or not isinstance(
+            response.get("hits"), list
+        ):
             logger.error("pixabay video search returned an unsupported response")
             return video_items
         videos = response["hits"]
         # loop through each video in the result
         for v in videos:
-            duration = v["duration"]
-            # check if video has desired minimum duration
-            if duration < minimum_duration:
+            if not isinstance(v, dict):
                 continue
-            video_files = v["videos"]
+            duration = v.get("duration")
+            # check if video has desired minimum duration
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration < minimum_duration
+            ):
+                continue
+            video_files = v.get("videos")
+            if not isinstance(video_files, dict):
+                continue
             # loop through each url to determine the best quality
-            for video_type in video_files:
-                video = video_files[video_type]
+            for video_type, video in video_files.items():
+                if not isinstance(video, dict):
+                    continue
                 try:
                     w = int(video["width"])
                     h = int(video["height"])
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, OverflowError, TypeError, ValueError):
+                    continue
+                video_url = video.get("url")
+                if not isinstance(video_url, str) or not video_url:
                     continue
                 # Pixabay 很少返回原生方形视频；1:1 输出继续接受满足分辨率的
                 # 候选并由合成阶段裁剪。横竖屏则必须严格匹配目标方向。
@@ -483,7 +518,7 @@ def search_videos_pixabay(
                 if orientation_matches and w >= video_width:
                     item = MaterialInfo()
                     item.provider = "pixabay"
-                    item.url = video["url"]
+                    item.url = video_url
                     item.duration = duration
                     item.source_info = {
                         "provider": "pixabay",
@@ -569,22 +604,33 @@ def search_videos_coverr(
         response = r.json()
         video_items: List[MaterialInfo] = []
 
-        if not isinstance(response, dict) or "hits" not in response:
+        if not isinstance(response, dict) or not isinstance(
+            response.get("hits"), list
+        ):
             logger.error("coverr video search returned an unsupported response")
             return video_items
 
         for v in response["hits"]:
+            if not isinstance(v, dict):
+                continue
             # duration 在不同响应里可能是 number(11.625) 或 string("10.500000")
             try:
                 duration = int(float(v.get("duration") or 0))
-            except (TypeError, ValueError):
+            except (OverflowError, TypeError, ValueError):
                 continue
             if duration < minimum_duration:
                 continue
 
             video_id = v.get("id")
-            mp4_download_url = (v.get("urls") or {}).get("mp4_download")
-            if not video_id or not mp4_download_url:
+            urls = v.get("urls")
+            if not isinstance(urls, dict):
+                continue
+            mp4_download_url = urls.get("mp4_download")
+            if (
+                not video_id
+                or not isinstance(mp4_download_url, str)
+                or not mp4_download_url
+            ):
                 continue
             if aspect != VideoAspect.square and not _matches_video_aspect(
                 v.get("max_width"),
@@ -653,8 +699,16 @@ class WaveSpeedUnconfirmedTaskError(RuntimeError):
 
     这类异常绝不等价于“该任务失败、可以重来”：远端任务可能仍在运行或已经
     完成并计费。素材流程必须就此停止，不再为后续关键词提交新的付费任务，
-    并把已提交的 prediction id 留在日志中供人工找回。
+    并把已提交的 prediction id 传给任务状态供人工找回。
     """
+
+    def __init__(self, message: str, prediction_id: str = ""):
+        super().__init__(message)
+        self.prediction_id = prediction_id
+
+
+class WaveSpeedDownloadError(RuntimeError):
+    """A paid prediction completed, but its video could not be saved locally."""
 
     def __init__(self, message: str, prediction_id: str = ""):
         super().__init__(message)
@@ -974,7 +1028,7 @@ def _save_generated_video_with_retry(
     下载已经付费生成的产物，失败时优先重试同一个地址。
 
     重新生成一次远端任务的代价是再付一次费，所以下载抖动必须先在原地址上
-    做有限次退避重试，重试耗尽才放弃该片段。
+    做有限次退避重试，重试耗尽后由调用方报告可恢复的付费任务失败。
     """
     for attempt in range(WAVESPEED_MAX_DOWNLOAD_RETRIES + 1):
         try:
@@ -1053,43 +1107,69 @@ def save_video(video_url: str, save_dir: str = "") -> str:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    # if video does not exist, download it
-    with open(video_path, "wb") as f:
-        f.write(
-            requests.get(
+    # A nonempty file is treated as a cache hit above. Keep the final path
+    # unpublished until the complete download has passed media validation, so a
+    # failed download cannot poison this or another concurrent task's cache.
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{video_id}-",
+            suffix=".mp4",
+            dir=save_dir,
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            with requests.get(
                 video_url,
                 headers=headers,
                 proxies=config.proxy,
                 verify=_get_tls_verify(),
                 timeout=(60, 240),
-            ).content
-        )
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        temp_file.write(chunk)
 
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+        if os.path.getsize(temp_path) == 0:
+            return ""
+
         clip = None
         try:
-            clip = VideoFileClip(video_path)
+            clip = VideoFileClip(temp_path)
             duration = clip.duration
             fps = clip.fps
-            if duration > 0 and fps > 0:
-                return video_path
+            if not (duration > 0 and fps > 0):
+                logger.warning(f"invalid video file: {temp_path} => invalid duration or fps")
+                return ""
         except Exception as e:
-            logger.warning(f"invalid video file: {video_path} => {str(e)}")
-            try:
-                os.remove(video_path)
-            except Exception as remove_error:
-                logger.warning(
-                    f"failed to remove invalid video file: {video_path}, error: {str(remove_error)}"
-                )
+            logger.warning(f"invalid video file: {temp_path} => {str(e)}")
+            return ""
         finally:
             if clip is not None:
                 try:
                     clip.close()
                 except Exception as close_error:
                     logger.warning(
-                        f"failed to close video clip: {video_path}, error: {str(close_error)}"
+                        f"failed to close video clip: {temp_path}, error: {str(close_error)}"
                     )
-    return ""
+
+        os.replace(temp_path, video_path)
+        temp_path = ""
+        return video_path
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError as remove_error:
+                logger.warning(
+                    f"failed to remove temporary video file: {temp_path}, "
+                    f"error: {str(remove_error)}"
+                )
 
 
 # OpenAI 兼容文生图（Issue #1274）通过 /images/generations 协议为脚本关键词
@@ -1889,8 +1969,9 @@ def _download_videos_wavespeed_on_demand(
 
     每个关键词天然对应一个脚本片段，生成即付费：先全量生成再挑选会为
     用不到的片段付费。这里每生成一段就立刻下载并累计有效时长（与库存
-    流程一致，按片段时长封顶），累计超过所需配音时长后不再触发新的生成
-    请求。单段失败按现有素材源约定跳过并继续下一段。
+    流程一致，按片段时长封顶），累计覆盖所需配音时长后不再触发新的生成
+    请求。远端明确失败的片段可跳过；状态不明或下载失败的付费任务必须
+    保留 ID 并终止本地任务。
     """
     video_paths: List[str] = []
     material_sources: list[dict[str, Any]] = []
@@ -1905,19 +1986,29 @@ def _download_videos_wavespeed_on_demand(
         except WaveSpeedUnconfirmedTaskError as e:
             # 已提交的付费任务状态不明：远端可能仍在运行或已经完成并计费。
             # 继续为后续关键词下单会造成重复生成和重复扣费，因此就地停止，
-            # 并把 prediction id 留在日志里供人工在控制台找回产物。
+            # 把 prediction id 交给任务层写入失败状态，供用户找回产物。
             logger.error(
                 "stop submitting new wavespeed tasks, the last submitted task "
                 f"is unconfirmed: prediction_id={e.prediction_id or 'unknown'}, "
                 f"detail={e}"
             )
-            break
+            _persist_material_sources(task_id, material_sources)
+            raise
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
                 item.url, material_directory, "wavespeed"
             )
             if not saved_video_path:
-                continue
+                source_info = (
+                    item.source_info if isinstance(item.source_info, dict) else {}
+                )
+                prediction_id = str(source_info.get("asset_id") or "").strip()
+                _persist_material_sources(task_id, material_sources)
+                raise WaveSpeedDownloadError(
+                    "WaveSpeed generated a paid video but the result could not be "
+                    f"downloaded: id={prediction_id or 'unknown'}",
+                    prediction_id=prediction_id,
+                )
             logger.info(f"video saved: {saved_video_path}")
             video_paths.append(saved_video_path)
             try:

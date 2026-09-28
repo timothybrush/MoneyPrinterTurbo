@@ -89,7 +89,14 @@ def create(
         )
 
     for segment in segments:
-        if word_level and segment.words:
+        if not segment.words:
+            # Faster Whisper exposes words as Optional[List[Word]]. A segment
+            # can still have usable text and timestamps when alignment yields
+            # no words; keep that subtitle in both sentence and word modes.
+            recognized(segment.text, segment.start, segment.end)
+            continue
+
+        if word_level:
             for word in segment.words:
                 cleaned_word = word.word.strip()
                 if cleaned_word:
@@ -319,6 +326,13 @@ def correct(subtitle_file, video_script):
                 )
             )
         script_index += 1
+        corrected = True
+
+    if subtitle_index < len(subtitle_items):
+        logger.warning(
+            f"Dropping {len(subtitle_items) - subtitle_index} transcription cue(s) "
+            "after the script ends"
+        )
         corrected = True
 
     if corrected:

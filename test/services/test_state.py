@@ -5,6 +5,7 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -72,6 +73,22 @@ class _FakeRedis:
 
 
 class TestMemoryState(unittest.TestCase):
+    def test_progress_update_preserves_existing_task_details(self):
+        state = MemoryState()
+        state.update_task(
+            "task-1",
+            state=const.TASK_STATE_PROCESSING,
+            video_subject="A day in Shanghai",
+            material_sources=["source.mp4"],
+        )
+
+        state.update_task("task-1", progress=25)
+
+        task = state.get_task("task-1")
+        self.assertEqual(task["progress"], 25)
+        self.assertEqual(task["video_subject"], "A day in Shanghai")
+        self.assertEqual(task["material_sources"], ["source.mp4"])
+
     def test_get_task_and_get_all_tasks_return_isolated_snapshots(self):
         state = MemoryState()
         state.update_task(
@@ -149,6 +166,27 @@ class TestMemoryState(unittest.TestCase):
 
 
 class TestRedisState(unittest.TestCase):
+    def test_update_task_writes_all_fields_in_one_redis_command(self):
+        state = RedisState.__new__(RedisState)
+        state._redis = Mock()
+
+        state.update_task(
+            "task-1",
+            state=const.TASK_STATE_COMPLETE,
+            progress=120,
+            videos=["final.mp4"],
+        )
+
+        state._redis.hset.assert_called_once_with(
+            "task-1",
+            mapping={
+                "task_id": "task-1",
+                "state": str(const.TASK_STATE_COMPLETE),
+                "progress": "100",
+                "videos": "['final.mp4']",
+            },
+        )
+
     def _build_state(self, batch_sizes):
         keys = [f"task:{i}".encode("utf-8") for i in range(sum(batch_sizes))]
         batches = []

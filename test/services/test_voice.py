@@ -316,6 +316,45 @@ class TestVoiceService(unittest.TestCase):
             self.assertEqual(len(sub_maker.events), 1)
             self.assertEqual(sub_maker.events[0]["type"], "WordBoundary")
 
+    def test_azure_tts_v1_rejects_boundary_only_stream(self):
+        """Subtitle events without audio must not produce a successful TTS result."""
+
+        class _BoundaryOnlyCommunicate:
+            def __init__(self, text, voice, rate="+0%", boundary=None):
+                pass
+
+            def stream_sync(self):
+                yield {
+                    "type": "WordBoundary",
+                    "offset": 0,
+                    "duration": 10000000,
+                    "text": "hello",
+                }
+
+        class _FakeSubMaker:
+            def __init__(self):
+                self.events = []
+
+            def feed(self, chunk):
+                self.events.append(chunk)
+
+            def get_srt(self):
+                return "1\n00:00:00,000 --> 00:00:01,000\nhello\n" if self.events else ""
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.edge_tts, "Communicate", _BoundaryOnlyCommunicate
+        ), patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker):
+            voice_file = Path(tmp_dir) / "boundary-only.mp3"
+            result = vs.azure_tts_v1(
+                text="hello",
+                voice_name="en-US-AriaNeural-Female",
+                voice_file=str(voice_file),
+                voice_rate=1.0,
+            )
+
+            self.assertIsNone(result)
+            self.assertFalse(voice_file.exists())
+
     def test_azure_tts_v1_times_out_hanging_stream_sync(self):
         """
         验证 Azure TTS V1 在 edge_tts 同步流卡住时能够快速失败。
@@ -1544,6 +1583,54 @@ class TestElevenLabsVoice(unittest.TestCase):
             f"({expected_end_100ns} units = {audio_duration_seconds}s)",
         )
 
+    def test_siliconflow_tts_bounds_each_network_attempt(self):
+        """A stalled speech endpoint must not block the task indefinitely."""
+        timeouts = []
+
+        def stalled_post(_url, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            raise vs.requests.exceptions.ReadTimeout("server stalled")
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(vs.requests, "post", side_effect=stalled_post),
+            patch.object(vs.config, "siliconflow", {"api_key": "test-key"}),
+        ):
+            voice_file = str(Path(temp_dir) / "narration.mp3")
+            result = vs.siliconflow_tts(
+                text="An example narration",
+                model="FunAudioLLM/CosyVoice2-0.5B",
+                voice="FunAudioLLM/CosyVoice2-0.5B:alex",
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
+            self.assertFalse(Path(voice_file).exists())
+
+        self.assertIsNone(result)
+        self.assertEqual(timeouts, [(10, 300)] * 3)
+
+    def test_siliconflow_tts_rejects_invalid_success_audio(self):
+        """HTTP 200 with corrupt audio must not become a fake 10-second success."""
+        fake_response = SimpleNamespace(status_code=200, content=b"invalid mp3")
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(vs.requests, "post", return_value=fake_response) as post,
+            patch.object(vs, "AudioFileClip", side_effect=OSError("invalid audio")),
+            patch.object(vs.config, "siliconflow", {"api_key": "test-key"}),
+        ):
+            voice_file = str(Path(temp_dir) / "narration.mp3")
+            result = vs.siliconflow_tts(
+                text="An example narration",
+                model="FunAudioLLM/CosyVoice2-0.5B",
+                voice="FunAudioLLM/CosyVoice2-0.5B:alex",
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
+            self.assertFalse(Path(voice_file).exists())
+
+        self.assertIsNone(result)
+        post.assert_called_once()
+
     def test_pause_tag_detection_and_parsing(self):
         """测试多语言停顿标签的检测、解析与清洗。"""
         sample_script = (
@@ -1597,6 +1684,52 @@ class TestElevenLabsVoice(unittest.TestCase):
         self.assertNotIn("[pausa", flex_cleaned)
         self.assertNotIn("(pausa", flex_cleaned)
         self.assertNotIn("[pause", flex_cleaned)
+
+    def test_concat_audio_files_reads_pcm_in_bounded_chunks(self):
+        """Long pause-aware narration should not load each WAV into memory."""
+        real_wave_open = vs.wave.open
+        read_sizes = []
+
+        class RecordingReader:
+            def __init__(self, reader):
+                self.reader = reader
+
+            def __enter__(self):
+                self.reader.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.reader.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.reader, name)
+
+            def readframes(self, frame_count):
+                read_sizes.append(frame_count)
+                return self.reader.readframes(frame_count)
+
+        def recording_wave_open(file, mode):
+            opened = real_wave_open(file, mode)
+            return RecordingReader(opened) if mode == "rb" else opened
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inputs = [str(Path(temp_dir) / f"input-{i}.wav") for i in range(2)]
+            output = str(Path(temp_dir) / "joined.wav")
+            for input_path in inputs:
+                with real_wave_open(input_path, "wb") as writer:
+                    writer.setnchannels(1)
+                    writer.setsampwidth(2)
+                    writer.setframerate(24000)
+                    writer.writeframes(b"\x01\x00" * 20000)
+
+            with patch.object(vs.wave, "open", side_effect=recording_wave_open):
+                self.assertTrue(vs._concat_audio_files(inputs, output))
+
+            with real_wave_open(output, "rb") as result:
+                self.assertEqual(result.getnframes(), 40000)
+
+        self.assertTrue(read_sizes)
+        self.assertLessEqual(max(read_sizes), 8192)
 
     def test_tts_with_pauses_shifts_submaker_timeline(self):
         """测试包含停顿标签时，SubMaker 时间轴和音频拼接正确偏移。"""

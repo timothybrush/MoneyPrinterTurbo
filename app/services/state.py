@@ -76,6 +76,10 @@ class MemoryState(BaseState):
 
         with self._lock:
             self._tasks[task_id] = {
+                # Keep fields from earlier pipeline stages, matching Redis
+                # HSET updates. A progress-only update must not erase the
+                # WebUI subject or diagnostic details already stored.
+                **self._tasks.get(task_id, {}),
                 "task_id": task_id,
                 "state": state,
                 "progress": progress,
@@ -171,8 +175,13 @@ class RedisState(BaseState):
             **kwargs,
         }
 
-        for field, value in fields.items():
-            self._redis.hset(task_id, field, str(value))
+        # One HSET writes the whole task state atomically. Separate commands
+        # could expose a new state with the previous progress or result fields
+        # to readers, and leave a partially updated record on network failure.
+        self._redis.hset(
+            task_id,
+            mapping={field: str(value) for field, value in fields.items()},
+        )
 
     def get_task(self, task_id: str):
         task_data = self._redis.hgetall(task_id)

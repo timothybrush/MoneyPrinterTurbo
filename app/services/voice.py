@@ -32,6 +32,7 @@ from app.config import config
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
+_SILICONFLOW_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
 _MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 _MIMO_DEFAULT_TTS_MODEL = "mimo-v2.5-tts"
 MINIMAX_TTS_GLOBAL_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -745,66 +746,75 @@ def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
         return True
 
     target_sample_rate = 24000
-    combined_pcm = bytearray()
     ffmpeg_binary = utils.get_ffmpeg_binary()
 
     with tempfile.TemporaryDirectory() as concat_temp:
-        for idx, f in enumerate(audio_files):
-            if not os.path.exists(f) or os.path.getsize(f) == 0:
-                continue
+        temp_combined_wav = os.path.join(concat_temp, "combined_master.wav")
+        combined_frames = 0
+        with wave.open(temp_combined_wav, "wb") as combined_wave:
+            combined_wave.setnchannels(1)
+            combined_wave.setsampwidth(2)
+            combined_wave.setframerate(target_sample_rate)
 
-            # 检查是否已经是 24000Hz 16-bit mono WAV
-            is_valid_pcm_wav = False
-            if f.lower().endswith(".wav"):
-                try:
-                    with wave.open(f, "rb") as wf:
-                        if (
-                            wf.getframerate() == target_sample_rate
-                            and wf.getnchannels() == 1
-                            and wf.getsampwidth() == 2
-                        ):
-                            is_valid_pcm_wav = True
-                            combined_pcm.extend(wf.readframes(wf.getnframes()))
-                except Exception:
-                    is_valid_pcm_wav = False
+            def append_pcm(reader):
+                nonlocal combined_frames
+                while chunk := reader.readframes(8192):
+                    combined_wave.writeframesraw(chunk)
+                    combined_frames += len(chunk) // 2
 
-            if not is_valid_pcm_wav:
-                # 使用 FFmpeg 将输入文件解码为 24000Hz 16-bit mono PCM WAV
-                pcm_wav = os.path.join(concat_temp, f"chunk_{idx}.wav")
-                cmd = [
-                    ffmpeg_binary,
-                    "-y",
-                    "-i",
-                    f,
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    str(target_sample_rate),
-                    "-codec:a",
-                    "pcm_s16le",
-                    pcm_wav,
-                ]
-                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-                if res.returncode == 0 and os.path.exists(pcm_wav):
+            for idx, f in enumerate(audio_files):
+                if not os.path.exists(f) or os.path.getsize(f) == 0:
+                    continue
+
+                # 检查是否已经是 24000Hz 16-bit mono WAV
+                is_valid_pcm_wav = False
+                if f.lower().endswith(".wav"):
                     try:
-                        with wave.open(pcm_wav, "rb") as wf:
-                            combined_pcm.extend(wf.readframes(wf.getnframes()))
-                    except Exception as e:
-                        logger.error(f"failed to read decoded pcm wav: {e}")
-                else:
-                    logger.error(f"failed to decode audio chunk with ffmpeg: {res.stderr}")
+                        with wave.open(f, "rb") as wf:
+                            if (
+                                wf.getframerate() == target_sample_rate
+                                and wf.getnchannels() == 1
+                                and wf.getsampwidth() == 2
+                            ):
+                                is_valid_pcm_wav = True
+                                append_pcm(wf)
+                    except Exception as exc:
+                        if is_valid_pcm_wav:
+                            logger.error(f"failed to stream PCM input: {exc}")
+                            return False
+                        is_valid_pcm_wav = False
 
-        if not combined_pcm:
+                if not is_valid_pcm_wav:
+                    # 使用 FFmpeg 将输入文件解码为 24000Hz 16-bit mono PCM WAV
+                    pcm_wav = os.path.join(concat_temp, f"chunk_{idx}.wav")
+                    cmd = [
+                        ffmpeg_binary,
+                        "-y",
+                        "-i",
+                        f,
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        str(target_sample_rate),
+                        "-codec:a",
+                        "pcm_s16le",
+                        pcm_wav,
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+                    if res.returncode == 0 and os.path.exists(pcm_wav):
+                        try:
+                            with wave.open(pcm_wav, "rb") as wf:
+                                append_pcm(wf)
+                        except Exception as e:
+                            logger.error(f"failed to read decoded pcm wav: {e}")
+                            return False
+                    else:
+                        logger.error(f"failed to decode audio chunk with ffmpeg: {res.stderr}")
+
+        if not combined_frames:
             logger.error("no valid audio samples to concatenate")
             return False
-
-        temp_combined_wav = os.path.join(concat_temp, "combined_master.wav")
-        with wave.open(temp_combined_wav, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(target_sample_rate)
-            wf.writeframes(combined_pcm)
 
         if output_file.lower().endswith(".wav"):
             shutil.copyfile(temp_combined_wav, output_file)
@@ -1350,6 +1360,13 @@ def azure_tts_v1(
                     communicate, _handle_chunk, timeout_seconds=timeout_seconds
                 )
 
+            # Edge can finish a stream with timing events but no audio payload.
+            # Those events produce a nonempty SRT, yet the MP3 is unplayable.
+            if os.path.getsize(voice_file) == 0:
+                logger.warning("failed, edge tts stream contained no audio")
+                os.remove(voice_file)
+                continue
+
             if not sub_maker.get_srt():
                 logger.warning("failed, sub_maker.get_srt() is empty")
                 continue
@@ -1428,9 +1445,17 @@ def siliconflow_tts(
                 f"start siliconflow tts, model: {model}, voice: {voice}, try: {i + 1}"
             )
 
-            response = requests.post(url, json=payload, headers=headers)
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=_SILICONFLOW_TTS_TIMEOUT_SECONDS,
+            )
 
             if response.status_code == 200:
+                if not response.content:
+                    logger.error("siliconflow tts returned empty audio")
+                    return None
                 # 保存音频文件
                 with open(voice_file, "wb") as f:
                     f.write(response.content)
@@ -1443,9 +1468,24 @@ def siliconflow_tts(
                         audio_duration = audio_clip.duration
                     finally:
                         audio_clip.close()
+                    if (
+                        not isinstance(audio_duration, (int, float))
+                        or not math.isfinite(audio_duration)
+                        or audio_duration <= 0
+                    ):
+                        raise ValueError("audio duration must be positive and finite")
                 except Exception as e:
-                    logger.warning(f"Failed to read audio duration: {str(e)}")
-                    audio_duration = 10.0
+                    # A 200 response is not proof that the bytes contain usable
+                    # narration. Returning a fabricated duration lets an invalid
+                    # file advance into the costly video pipeline.
+                    logger.error(f"siliconflow tts returned invalid audio: {e}")
+                    try:
+                        os.remove(voice_file)
+                    except OSError as cleanup_error:
+                        logger.warning(
+                            f"failed to remove invalid siliconflow audio: {cleanup_error}"
+                        )
+                    return None
 
                 logger.success(f"siliconflow tts succeeded: {voice_file}")
                 return populate_legacy_submaker_with_full_text(

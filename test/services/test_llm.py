@@ -155,6 +155,25 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIs(captured["app_config"], app_config)
         self.assertEqual(captured["app_config"]["openai_api_key"], "snapshot-key")
 
+    def test_generate_script_retries_provider_error_instead_of_using_it_as_narration(self):
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=["Error: temporary provider failure", "Real narration."],
+        ) as generate_response:
+            result = llm.generate_script(video_subject="Coffee")
+
+        self.assertEqual(result, "Real narration.")
+        self.assertEqual(generate_response.call_count, 2)
+
+    def test_generate_script_returns_empty_when_provider_always_fails(self):
+        with patch.object(
+            llm, "_generate_response", return_value="Error: invalid API key"
+        ):
+            result = llm.generate_script(video_subject="Coffee")
+
+        self.assertEqual(result, "")
+
     def test_generate_script_strips_each_bracket_group_independently(self):
         """
         format_response must remove each [bracket] and (paren) group in
@@ -233,6 +252,24 @@ class TestScriptPromptOptions(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertIsInstance(result, list)
+
+    def test_generate_terms_retries_non_string_items_in_recovered_json(self):
+        """The prose-wrapped JSON recovery path must enforce List[str] too."""
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=[
+                'Search terms: [123, {"query": "coffee"}]',
+                'Search terms: ["coffee beans", "barista tools"]',
+            ],
+        ) as generate_response:
+            result = llm.generate_terms(
+                video_subject="Coffee",
+                video_script="How to brew coffee.",
+            )
+
+        self.assertEqual(result, ["coffee beans", "barista tools"])
+        self.assertEqual(generate_response.call_count, 2)
 
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """
