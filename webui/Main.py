@@ -254,6 +254,9 @@ SETTINGS_PRESET_FILE_NAME = "moneyprinterturbo-settings.json"
 KEY_BACKUP_SCHEMA = "moneyprinterturbo.key-backup"
 KEY_BACKUP_VERSION = 1
 KEY_BACKUP_FILE_NAME = "moneyprinterturbo-keys.json"
+# Export files contain only settings or credentials, not media. Reject oversized
+# uploads before decoding and parsing them in the Streamlit process.
+MAX_SETTINGS_TRANSFER_BYTES = 2 * 1024 * 1024
 # 预设只描述生成参数。素材、配音和配乐都是本机文件路径，预设通常要在另一台
 # 机器或另一个容器里导入，带上这些路径只会指向不存在的文件。
 PRESET_EXCLUDED_PARAM_KEYS = frozenset(
@@ -809,7 +812,11 @@ def _safe_load_task_script(task_path):
 
     try:
         with open(script_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            logger.warning(f"task script data is not an object: {script_file}")
+            return {}
+        return payload
     except Exception as e:
         logger.warning(f"failed to read task script data: {script_file}, {e}")
         return {}
@@ -1002,11 +1009,16 @@ def _scan_history_tasks(limit=30):
     tasks = []
     for mtime, name, task_path in task_entries[:limit]:
         script_data = _safe_load_task_script(task_path)
-        params_data = script_data.get("params", {}) if script_data else {}
+        params_data = script_data.get("params", {})
+        if not isinstance(params_data, dict):
+            params_data = {}
+        script_text = script_data.get("script", "")
+        if not isinstance(script_text, str):
+            script_text = ""
         video_file = _find_final_task_video(task_path)
         subject = (
             params_data.get("video_subject")
-            or script_data.get("script", "")[:40]
+            or script_text[:40]
             or name
         )
         tasks.append(
@@ -1027,12 +1039,28 @@ def _scan_history_tasks(limit=30):
 
 def _collect_task_summaries(limit=20):
     history_tasks = {task["task_id"]: task for task in _scan_history_tasks(limit=50)}
+    active_tasks = _active_generation_tasks()
 
     try:
         runtime_tasks, _ = sm.state.get_all_tasks(1, 50)
     except Exception as e:
         logger.warning(f"failed to load runtime tasks: {e}")
         runtime_tasks = []
+
+    # The paginated state view can omit this session's newer tasks after 50
+    # older records. Read those active IDs directly so a completed or failed
+    # task cannot remain labelled as processing forever.
+    runtime_ids = {task.get("task_id") for task in runtime_tasks}
+    for task_id in active_tasks:
+        if task_id in runtime_ids:
+            continue
+        try:
+            task = sm.state.get_task(task_id)
+        except Exception as e:
+            logger.warning(f"failed to load active task {task_id}: {e}")
+            continue
+        if task:
+            runtime_tasks.append(task)
 
     for task in runtime_tasks:
         task_id = task.get("task_id", "")
@@ -1051,6 +1079,16 @@ def _collect_task_summaries(limit=20):
             or (task.get("script", "")[:40] if task.get("script") else "")
             or task_id
         )
+        task_mtime = active_tasks.get(task_id, {}).get("mtime") or history_task.get(
+            "mtime", 0
+        )
+        if os.path.isdir(task_path):
+            try:
+                task_mtime = os.path.getmtime(task_path)
+            except OSError:
+                # Another session can delete this directory between isdir and
+                # getmtime. Keep rendering the persisted task state.
+                pass
 
         history_tasks[task_id] = {
             "task_id": task_id,
@@ -1058,15 +1096,13 @@ def _collect_task_summaries(limit=20):
             "state": task.get("state"),
             "cross_post_state": task.get("cross_post_state"),
             "progress": int(task.get("progress", 0) or 0),
-            "mtime": os.path.getmtime(task_path)
-            if os.path.isdir(task_path)
-            else history_task.get("mtime", 0),
+            "mtime": task_mtime,
             "task_path": task_path,
             "video_file": video_file,
             "source": "runtime",
         }
 
-    for task_id, active_task in _active_generation_tasks().items():
+    for task_id, active_task in active_tasks.items():
         history_task = history_tasks.get(task_id, {})
         if history_task and _task_state_filter_key(history_task) in {
             "complete",
@@ -2887,6 +2923,8 @@ def _load_transfer_payload(raw_bytes, schema, version):
     提示停留在导入入口，而不是把无法识别的内容写进配置或控件状态。
     Windows 编辑器可能保存带 BOM 的 JSON，因此按 utf-8-sig 解码。
     """
+    if len(raw_bytes) > MAX_SETTINGS_TRANSFER_BYTES:
+        raise ValueError("settings import exceeds the 2 MB limit")
     payload = json.loads(raw_bytes.decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError("exported file must contain a JSON object")
