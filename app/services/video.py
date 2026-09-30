@@ -575,6 +575,8 @@ def concat_video_clips_with_ffmpeg(
             delete_files(concat_list_file)
         raise
 
+    staged_output = None
+
     def build_command(codec: str) -> list[str]:
         command = [
             utils.get_ffmpeg_binary(),
@@ -594,23 +596,29 @@ def concat_video_clips_with_ffmpeg(
         ]
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
-        command.append(output_file)
+        command.append(staged_output)
         return command
 
     def run_concat(codec: str):
         command = build_command(codec)
         # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
         # 从而降低画质劣化与颜色偏移风险。阻塞等待期间由心跳日志体现任务仍在运行。
-        result = _run_concat_with_heartbeat(command, output_file)
+        result = _run_concat_with_heartbeat(command, staged_output)
         if result.returncode != 0:
             error_message = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(error_message or "ffmpeg concat failed")
         return codec
 
     try:
+        descriptor, staged_output = tempfile.mkstemp(
+            prefix=".ffmpeg-concat-",
+            suffix=os.path.splitext(output_file)[1] or ".mp4",
+            dir=os.path.dirname(os.path.abspath(output_file)),
+        )
+        os.close(descriptor)
         effective_codec = _get_effective_video_codec()
         try:
-            return run_concat(effective_codec)
+            result_codec = run_concat(effective_codec)
         except TimeoutError:
             # A hung encoder is not evidence that another codec will work. Do
             # not spend a second timeout period retrying the same input.
@@ -620,9 +628,14 @@ def concat_video_clips_with_ffmpeg(
                 raise
             result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
             _disable_runtime_video_codec(effective_codec, str(exc))
-            return result_codec
+        # Failed attempts and in-progress output stay private until FFmpeg has
+        # finished. Publication errors must not trigger another codec attempt.
+        if os.path.getsize(staged_output) == 0:
+            raise RuntimeError("ffmpeg concat produced no output")
+        os.replace(staged_output, output_file)
+        return result_codec
     finally:
-        delete_files(concat_list_file)
+        delete_files([concat_list_file, staged_output])
 
 
 def _sanitize_image_file(image_path: str) -> str:
@@ -1761,9 +1774,10 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
             continue
 
         ext = utils.parse_extension(material_source_path)
+        is_image = ext in const.FILE_TYPE_IMAGES
         try:
             # 图片素材直接按图片方式读取，避免先走 VideoFileClip 误判后触发不稳定的回退分支。
-            if ext in const.FILE_TYPE_IMAGES:
+            if is_image:
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path
                 )
@@ -1775,6 +1789,9 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 clip, material_source_path = _open_image_clip_with_fallback(
                     material_source_path
                 )
+                # The successful decoder determines the material kind, even
+                # when the uploaded filename has a video or unknown suffix.
+                is_image = True
             except Exception as exc:
                 logger.warning(
                     f"skip unreadable local material: {material.url}, error: {str(exc)}"
@@ -1793,7 +1810,7 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 close_clip(clip)
                 continue
 
-            if ext in const.FILE_TYPE_IMAGES:
+            if is_image:
                 logger.info(f"processing image: {material_source_path}")
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再渲染
                 # 用于导出的图片片段。

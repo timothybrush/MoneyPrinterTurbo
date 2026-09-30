@@ -30,6 +30,7 @@ from openai import OpenAI
 
 from app.config import config
 from app.utils import utils
+from app.utils.subtitle_writer import staged_subtitle_file
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
 _SILICONFLOW_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
@@ -1965,6 +1966,7 @@ def mimo_tts(
 
     _configure_pydub_ffmpeg(AudioSegment)
 
+    temporary_audio = None
     try:
         logger.info(
             f"start mimo tts, model: {model_name}, voice: {voice_name}"
@@ -2006,26 +2008,44 @@ def mimo_tts(
         audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
 
         output_format = utils.parse_extension(voice_file) or "mp3"
+        descriptor, temporary_audio = tempfile.mkstemp(
+            prefix=".mimo-tts-", suffix=f".{output_format}",
+            dir=os.path.dirname(os.path.abspath(voice_file)),
+        )
+        os.close(descriptor)
         if output_format == "wav":
-            with open(voice_file, "wb") as f:
+            with open(temporary_audio, "wb") as f:
                 f.write(audio_bytes)
         else:
-            audio_segment.export(voice_file, format=output_format)
+            exported_audio = audio_segment.export(temporary_audio, format=output_format)
+            if exported_audio is not None:
+                exported_audio.close()
 
         audio_duration = len(audio_segment) / 1000.0
+        if audio_duration <= 0:
+            raise ValueError("MiMo TTS returned empty audio")
         sub_maker = ensure_legacy_submaker_fields(SubMaker())
+        populated_sub_maker = populate_legacy_submaker_with_full_text(
+            sub_maker=sub_maker,
+            text=text,
+            audio_duration_seconds=audio_duration,
+        )
+        os.replace(temporary_audio, voice_file)
+        temporary_audio = None
         logger.success(f"mimo tts succeeded: {voice_file}")
         logger.debug(
             "mimo subtitle timeline generated, "
             f"duration: {audio_duration:.3f}s, output_format: {output_format}"
         )
-        return populate_legacy_submaker_with_full_text(
-            sub_maker=sub_maker,
-            text=text,
-            audio_duration_seconds=audio_duration,
-        )
+        return populated_sub_maker
     except Exception as e:
         logger.error(f"mimo tts failed: {str(e)}")
+    finally:
+        if temporary_audio and os.path.exists(temporary_audio):
+            try:
+                os.remove(temporary_audio)
+            except OSError as cleanup_error:
+                logger.warning(f"failed to remove temporary MiMo audio: {cleanup_error}")
 
     return None
 
@@ -3200,28 +3220,23 @@ def _match_script_line(script_lines: list[str], current_text: str, sub_index: in
 
 
 def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
-    """
-    将已经聚合好的字幕段写入到 SRT 文件，并做一次基本可读性验证。
-
-    返回值：
-    - `True`：字幕文件成功落盘且可被 moviepy 解析；
-    - `False`：字幕文件写入或解析失败。
-    """
+    """Publish a complete, parseable SRT without destroying earlier captions."""
     try:
         ensure_file_path_exists(subtitle_file)
-        with open(subtitle_file, "w", encoding="utf-8") as file:
-            file.write("\n".join(sub_items) + "\n")
-
-        sbs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
-        duration = max([tb for ((ta, tb), txt) in sbs]) if sbs else 0
+        with staged_subtitle_file(subtitle_file) as staged:
+            with open(staged, "w", encoding="utf-8") as file:
+                file.write("\n".join(sub_items) + "\n")
+            sbs = subtitles.file_to_subtitles(staged, encoding="utf-8")
+            if not sbs:
+                raise ValueError("subtitle output contains no cues")
+            duration = max(tb for ((ta, tb), txt) in sbs)
+            os.replace(staged, subtitle_file)
         logger.info(
             f"completed, subtitle file created: {subtitle_file}, duration: {duration}"
         )
         return True
     except Exception as e:
         logger.error(f"failed, error: {str(e)}")
-        if os.path.exists(subtitle_file):
-            os.remove(subtitle_file)
         return False
 
 

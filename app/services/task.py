@@ -35,6 +35,7 @@ from app.services import (
 from app.services import upload_post
 from app.services import state as sm
 from app.utils import file_security, utils
+from app.utils.subtitle_writer import staged_subtitle_file
 
 
 # 发布请求最长可等待数分钟，不能继续占用视频生成任务的并发名额。
@@ -589,7 +590,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     if not params.subtitle_enabled:
         return ""
 
-    subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
+    final_subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
     subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
@@ -609,40 +610,46 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
 
-    if subtitle_provider == "edge":
-        voice.create_subtitle(
-            text=video_script,
-            sub_maker=sub_maker,
-            subtitle_file=subtitle_path,
-            word_level=is_word_level,
-        )
-        if not os.path.exists(subtitle_path):
-            # Edge 字幕偶尔会因为时间轴与文案无法匹配而没有产出文件。这里不能
-            # 自动切换到 Whisper，否则首次失败会在用户不知情的情况下下载数 GB
-            # 的模型。只有显式配置 Whisper 时才允许加载模型，Edge 失败则保留
-            # 无字幕视频并记录原因，避免意外的网络和磁盘开销。
-            logger.warning(
-                "edge subtitle generation did not produce a subtitle file; "
-                "skip subtitles without falling back to whisper"
+    # A failed retry must never reuse captions from an earlier narration.
+    with staged_subtitle_file(final_subtitle_path) as subtitle_path:
+        if subtitle_provider == "edge":
+            voice.create_subtitle(
+                text=video_script,
+                sub_maker=sub_maker,
+                subtitle_file=subtitle_path,
+                word_level=is_word_level,
             )
+            if not os.path.exists(subtitle_path):
+                # Edge 字幕偶尔会因为时间轴与文案无法匹配而没有产出文件。这里不能
+                # 自动切换到 Whisper，否则首次失败会在用户不知情的情况下下载数 GB
+                # 的模型。只有显式配置 Whisper 时才允许加载模型，Edge 失败则保留
+                # 无字幕视频并记录原因，避免意外的网络和磁盘开销。
+                logger.warning(
+                    "edge subtitle generation did not produce a subtitle file; "
+                    "skip subtitles without falling back to whisper"
+                )
+                return ""
+
+        if subtitle_provider == "whisper":
+            subtitle.create(
+                audio_file=audio_file,
+                subtitle_file=subtitle_path,
+                word_level=is_word_level,
+            )
+            if not subtitle.file_to_subtitles(subtitle_path):
+                logger.warning("whisper produced no usable subtitle cues")
+                return ""
+            if not is_word_level:
+                logger.info("\n\n## correcting subtitle")
+                subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+
+        subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
+        if not subtitle_lines:
+            logger.warning(f"subtitle file is invalid: {subtitle_path}")
             return ""
 
-    if subtitle_provider == "whisper":
-        subtitle.create(
-            audio_file=audio_file,
-            subtitle_file=subtitle_path,
-            word_level=is_word_level,
-        )
-        if not is_word_level:
-            logger.info("\n\n## correcting subtitle")
-            subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
-
-    subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
-    if not subtitle_lines:
-        logger.warning(f"subtitle file is invalid: {subtitle_path}")
-        return ""
-
-    return subtitle_path
+        os.replace(subtitle_path, final_subtitle_path)
+        return final_subtitle_path
 
 
 def get_video_materials(
@@ -1165,6 +1172,7 @@ def _run_cross_post(
     platforms: tuple[str, ...],
     youtube_privacy_status: str,
     youtube_made_for_kids: bool = False,
+    upload_account: dict | None = None,
 ) -> None:
     """后台执行跨平台发布，并只补充发布相关的任务字段。"""
     results = []
@@ -1244,12 +1252,16 @@ def _run_cross_post(
                         f"task_id={task_id}, request_id={request_id}"
                     )
 
+            upload_kwargs = {}
+            if upload_account is not None:
+                upload_kwargs["account"] = upload_account
             result = upload_post.cross_post_video(
                 video_path=video_path,
                 title=post_title,
                 platforms=list(platforms),
                 youtube_extra=youtube_extra,
                 on_background_start=record_background_request,
+                **upload_kwargs,
             )
             if not isinstance(result, dict):
                 result = {
@@ -1390,6 +1402,7 @@ def _schedule_cross_post(
             tuple(platforms),
             youtube_privacy_status,
             youtube_made_for_kids,
+            upload_post.upload_post_service.snapshot_account(),
         )
         _register_cross_post_future(task_id, future)
         future.add_done_callback(partial(_finalize_cross_post_future, task_id))
@@ -1621,6 +1634,12 @@ def _run_pipeline(
     )
 
     if stop_at == "subtitle":
+        if not subtitle_path:
+            return _mark_task_failed(
+                task_id,
+                "subtitle",
+                "failed to generate subtitles; verify the subtitle provider and timeline",
+            )
         sm.state.update_task(
             task_id,
             state=const.TASK_STATE_COMPLETE,
