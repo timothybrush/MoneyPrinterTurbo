@@ -558,10 +558,22 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
 ):
-    concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
-    with open(concat_list_file, "w", encoding="utf-8") as fp:
-        for clip_file in clip_files:
-            fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
+    # Separate renders may share a directory. Each FFmpeg process must keep its
+    # own manifest until all codec attempts finish, without overwriting or
+    # deleting another render's list.
+    concat_list_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="ffmpeg-concat-", suffix=".txt",
+            dir=output_dir, delete=False,
+        ) as fp:
+            concat_list_file = fp.name
+            for clip_file in clip_files:
+                fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
+    except Exception:
+        if concat_list_file:
+            delete_files(concat_list_file)
+        raise
 
     def build_command(codec: str) -> list[str]:
         command = [
@@ -641,6 +653,9 @@ def _open_image_clip_with_fallback(image_path: str):
         return ImageClip(sanitized_path), sanitized_path
 
 
+_moviepy_reader_open_lock = threading.Lock()
+
+
 def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileClip:
     """
     安静地打开视频文件，避免 MoviePy 2.1.x 把 ffmpeg 探测信息直接打印到 stdout。
@@ -658,8 +673,12 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
     3. 如果依赖库确实输出了内容，降级为 debug 日志，便于必要时排查。
     """
     captured_stdout = io.StringIO()
-    with redirect_stdout(captured_stdout):
-        clip = VideoFileClip(video_path, audio=audio)
+    # redirect_stdout changes process-wide state. Overlapping reader opens can
+    # restore each other's capture buffers instead of the original stdout.
+    # Serialize this short construction window; clip processing stays parallel.
+    with _moviepy_reader_open_lock:
+        with redirect_stdout(captured_stdout):
+            clip = VideoFileClip(video_path, audio=audio)
 
     moviepy_stdout = captured_stdout.getvalue().strip()
     if moviepy_stdout:
@@ -1584,7 +1603,7 @@ def generate_video(
                 font_size=params.font_size,
             )
 
-        if subtitle_path and os.path.exists(subtitle_path):
+        if params.subtitle_enabled and subtitle_path and os.path.exists(subtitle_path):
             sub = clip_stack.enter_context(
                 SubtitlesClip(
                     subtitles=subtitle_path,
