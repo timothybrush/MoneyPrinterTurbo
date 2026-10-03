@@ -130,8 +130,10 @@ def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) 
         )
         return file
 
-    relative_path = os.path.relpath(resolved_path, task_dir).replace("\\", "/")
-    uri_path = f"tasks/{relative_path}"
+    relative_path = os.path.relpath(
+        resolved_path, os.path.realpath(task_dir)
+    ).replace("\\", "/")
+    uri_path = f"tasks/{quote(relative_path, safe='/')}"
     if endpoint:
         return f"{endpoint.rstrip('/')}/{uri_path}"
     return f"/{uri_path}"
@@ -364,10 +366,15 @@ def get_bgm_list(request: Request):
     bgm_list = []
     for file in bgm_service.list_bgm_files():
         filename = os.path.basename(file)
+        try:
+            size = os.path.getsize(file)
+        except OSError as exc:
+            logger.warning(f"skip unavailable background music: name={filename}, error={exc}")
+            continue
         bgm_list.append(
             {
                 "name": filename,
-                "size": os.path.getsize(file),
+                "size": size,
                 # 只返回文件名，避免把服务器绝对路径暴露给调用方。服务端会
                 # 在 storage/bgm 和 resource/songs 两个白名单目录中重新解析。
                 "file": filename,
