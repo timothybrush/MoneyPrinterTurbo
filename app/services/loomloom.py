@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -463,6 +464,11 @@ class LoomLoomScriptBackend:
         last_progress_log_at = started_at
         consecutive_poll_errors = 0
         while True:
+            if self._clock() >= deadline:
+                raise LoomLoomRunError(
+                    f"LoomLoom run {run_id} did not complete within "
+                    f"{self.settings.run_timeout_seconds:g} seconds"
+                )
             try:
                 run = self.get_run(run_id)
                 consecutive_poll_errors = 0
@@ -513,7 +519,7 @@ class LoomLoomScriptBackend:
                     f"LoomLoom run {run.run_id} did not complete within "
                     f"{self.settings.run_timeout_seconds:g} seconds"
                 )
-            self._sleep(self.settings.poll_interval_seconds)
+            self._sleep(min(self.settings.poll_interval_seconds, deadline - now))
 
     def get_script_results(self, run_id: str) -> LoomLoomScriptBatchResult:
         normalized_run_id = self._required_identifier(run_id, "run_id")
@@ -936,7 +942,7 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
         return {**matching[0], "accessUrl": access_url}
 
     def _download_video_artifact(self, access_url: str, destination: str) -> None:
-        temporary = destination + ".part"
+        temporary = None
         downloaded_bytes = 0
         response = None
         try:
@@ -949,7 +955,11 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
             content_length = int(response.headers.get("content-length", 0) or 0)
             if content_length > MAX_VIDEO_ARTIFACT_BYTES:
                 raise LoomLoomAPIError("video artifact exceeds the download limit")
-            with open(temporary, "wb") as output:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=os.path.dirname(destination) or ".",
+                prefix=os.path.basename(destination) + ".", suffix=".part", delete=False,
+            ) as output:
+                temporary = output.name
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -980,5 +990,5 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
                         "failed to close LoomLoom video download response: "
                         f"error={type(exc).__name__}"
                     )
-            if os.path.exists(temporary):
+            if temporary is not None and os.path.exists(temporary):
                 os.remove(temporary)
