@@ -204,16 +204,7 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
 }
-LOCAL_MATERIAL_EXTENSIONS = {
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".flv",
-    ".mkv",
-    ".jpg",
-    ".jpeg",
-    ".png",
-}
+LOCAL_MATERIAL_EXTENSIONS = set(material_upload_service.SUPPORTED_MATERIAL_EXTENSIONS)
 CUSTOM_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 _FINAL_VIDEO_PATTERN = re.compile(
     r"^final-(?P<index>\d+)\.(?P<extension>mp4|mov|mkv|webm)$",
@@ -839,7 +830,7 @@ def _find_final_task_video(task_path: str) -> str:
     candidates = []
     for file_name in files:
         match = _FINAL_VIDEO_PATTERN.fullmatch(file_name)
-        if match:
+        if match and os.path.isfile(os.path.join(task_path, file_name)):
             candidates.append((int(match.group("index")), file_name))
 
     if not candidates:
@@ -1216,10 +1207,12 @@ def _delete_task(task_id, task_path, task_state=None):
         return False
 
     try:
-        if hasattr(sm.state, "delete_task"):
-            sm.state.delete_task(task_id)
         if os.path.isdir(normalized_path):
             shutil.rmtree(normalized_path)
+        # Keep the persisted task available for retry when file removal fails
+        # (for example, a video is still locked by another process on Windows).
+        if hasattr(sm.state, "delete_task"):
+            sm.state.delete_task(task_id)
         logger.info(f"deleted task: {task_id}")
         return True
     except Exception as e:
